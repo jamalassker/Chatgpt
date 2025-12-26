@@ -22,7 +22,6 @@ SYMBOLS = [
 
 BASE_USD = 25
 TP, SL = 0.0045, 0.0030
-# Combined stream URL for multiple symbols
 STREAMS = "/".join([f"{s}@aggTrade" for s in SYMBOLS])
 WS_URL = f"wss://stream.binance.com:9443/stream?streams={STREAMS}"
 
@@ -42,7 +41,6 @@ class MLFilter:
 # ================= MULTI-SYMBOL HFT ENGINE =================
 class AlphaHFT:
     def __init__(self):
-        # Per-symbol state tracking
         self.state = {s: {
             "price_history": deque(maxlen=200),
             "trade_flow": deque(maxlen=100),
@@ -67,18 +65,31 @@ class AlphaHFT:
     async def telegram_dashboard(self, session):
         while True:
             try:
-                total_pnl = sum(self.closed_trades)
-                active_pos = [s for s, data in self.state.items() if data["position"]]
+                # Calculate Total Banked PnL
+                total_banked = sum(self.closed_trades)
+                
+                # Calculate Combined Floating PnL from all active positions
+                total_floating = 0.0
+                active_list = []
+                for s_name, data in self.state.items():
+                    if data["position"]:
+                        float_pnl = (data["current_price"] - data["position"]["entry"]) * data["position"]["amount"]
+                        total_floating += float_pnl
+                        active_list.append(s_name.upper())
+
+                float_icon = "📈" if total_floating >= 0 else "📉"
                 
                 msg = (
                     f"<b>🤖 AI HFT TOP 20 ACTIVE</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Active Positions:</b> {len(active_pos)}\n"
-                    f"<b>Banked PnL:</b> ${total_pnl:+.2f}\n"
-                    f"<b>Win Rate:</b> {self.get_winrate()}%\n"
+                    f"<b>Active Trades:</b> {len(active_list)}\n"
+                    f"<b>Assets:</b> {', '.join(active_list) if active_list else 'None'}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<b>Last Symbol:</b> {active_pos[-1].upper() if active_pos else 'None'}\n"
-                    f"<b>Updated:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+                    f"<b>{float_icon} Floating P&L:</b> ${total_floating:+.4f}\n"
+                    f"<b>💰 Banked PnL:</b> ${total_banked:+.2f}\n"
+                    f"<b>🏆 Win Rate:</b> {self.get_winrate()}%\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>Last Update:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC"
                 )
                 
                 if not self.tg_id:
@@ -89,8 +100,9 @@ class AlphaHFT:
                 else:
                     await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText", 
                                        json={"chat_id": TELEGRAM_CHAT_ID, "message_id": self.tg_id, "text": msg, "parse_mode": "HTML"})
-            except: pass
-            await asyncio.sleep(3)
+            except Exception as e:
+                log.error(f"Dashboard Error: {e}")
+            await asyncio.sleep(2)
 
     def get_winrate(self):
         if not self.closed_trades: return 0
@@ -101,7 +113,7 @@ class AlphaHFT:
         async with aiohttp.ClientSession() as session:
             asyncio.create_task(self.telegram_dashboard(session))
             async with session.ws_connect(WS_URL) as ws:
-                log.info("Top 20 AggTrade Stream Connected")
+                log.info("Top 20 Stream Connected with Floating P&L Monitor")
                 async for msg in ws:
                     raw_data = json.loads(msg.data)
                     stream_name = raw_data['stream'].split('@')[0]
@@ -129,10 +141,10 @@ class AlphaHFT:
                             log.info(f"AI BUY: {stream_name.upper()} at {s['current_price']}")
 
                     elif s["position"]:
-                        pnl = (s["current_price"] - s["position"]["entry"]) / s["position"]["entry"]
-                        if pnl >= TP or pnl <= -SL:
+                        pnl_pct = (s["current_price"] - s["position"]["entry"]) / s["position"]["entry"]
+                        if pnl_pct >= TP or pnl_pct <= -SL:
                             self.closed_trades.append((s["current_price"] - s["position"]["entry"]) * s["position"]["amount"])
-                            log.info(f"EXIT {stream_name.upper()} | PnL: {pnl:.4f}")
+                            log.info(f"EXIT {stream_name.upper()} | PnL: {pnl_pct:.4f}")
                             s["position"] = None
 
 if __name__ == "__main__":
