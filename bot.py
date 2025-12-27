@@ -149,8 +149,21 @@ class AlphaHFT:
                 log.error(f"Loop Error: {e}")
             finally:
                 await self.exchange.close()
-
 if __name__ == "__main__":
     bot = AlphaHFT()
-    try: asyncio.run(bot.run())
-    except KeyboardInterrupt: pass
+    
+    async def main_loop():
+        while True:
+            try:
+                log.info("🔄 Starting Bot Engine...")
+                await bot.run()
+            except Exception as e:
+                log.error(f"⚠️ Critical Crash: {e}")
+                log.info("🔁 Restarting in 10 seconds...")
+                await asyncio.sleep(10) # Wait before restarting to avoid spamming Bybit
+
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        log.info("🛑 Manual Shutdown received.")
+
