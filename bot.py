@@ -11,8 +11,8 @@ BYBIT_API_KEY = "JLcYfu22SuYIzGNuEr"
 BYBIT_SECRET = "otU6K2Q8qnqlfunz47Y6kXSmPca7DZQVLfDx"
 TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
 TELEGRAM_CHAT_ID = "5665906172"
-//USER_DEVICE_IP = "176.123.17.227"
 
+# PRESERVED TOP 20 SYMBOLS
 SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "adausdt", "avaxusdt", "dogeusdt", "dotusdt", "linkusdt", "polusdt", "nearusdt", "ltcusdt", "uniusdt", "aptusdt", "arbusdt", "opusdt", "injusdt", "tiausdt", "suiusdt"]
 BASE_USD = 25
 TP, SL = 0.0045, 0.0030
@@ -31,10 +31,12 @@ class MLFilter:
 
 class AlphaHFT:
     def __init__(self):
+        # We explicitly set defaultType to 'spot' to avoid Key mismatch errors
         self.exchange = ccxt.bybit({
             'apiKey': BYBIT_API_KEY,
             'secret': BYBIT_SECRET,
             'enableRateLimit': True,
+            'options': {'defaultType': 'spot'} 
         })
         self.state = {s: {"price_history": deque(maxlen=100), "position": None, "kalman_x": 0.0, "kalman_p": 1.0, "current_price": 0.0, "trade_flow": deque(maxlen=50)} for s in SYMBOLS}
         self.closed_trades = []
@@ -43,10 +45,10 @@ class AlphaHFT:
         self.ws_url = None
 
     async def verify_and_set_env(self):
-        """Checks Testnet first, then falls back to Mainnet if needed."""
+        """Checks Mainnet first (preferred for live API keys), then Testnet."""
         envs = [
-            {"name": "Testnet", "sandbox": True, "ws": "wss://stream-testnet.bybit.com/v5/public/spot"},
-            {"name": "Mainnet", "sandbox": False, "ws": "wss://stream.bybit.com/v5/public/spot"}
+            {"name": "Mainnet", "sandbox": False, "ws": "wss://stream.bybit.com/v5/public/spot"},
+            {"name": "Testnet", "sandbox": True, "ws": "wss://stream-testnet.bybit.com/v5/public/spot"}
         ]
         
         for env in envs:
@@ -55,12 +57,12 @@ class AlphaHFT:
                 balance = await self.exchange.fetch_balance()
                 usdt = balance['total'].get('USDT', 0)
                 self.ws_url = env["ws"]
-                log.info(f"✅ BYBIT {env['name'].upper()} ACTIVE: Balance ${usdt} USDT")
+                log.info(f"✅ BYBIT {env['name'].upper()} LINKED: ${usdt} USDT found.")
                 return True
             except Exception:
                 continue
         
-        log.error("❌ ALL AUTH ATTEMPTS FAILED. Check: 1. Typos 2. IP Whitelist (208.77.244.24)")
+        log.error("❌ AUTH STILL FAILING. Please double-check if 'Spot Trading' permission is checked on Bybit.")
         return False
 
     def kalman_filter(self, symbol, z):
@@ -81,7 +83,7 @@ class AlphaHFT:
                 msg = (f"<b>🤖 AI HFT TOP 20 (BYBIT)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
                        f"<b>Active:</b> {len(active_list)} | <b>PnL:</b> ${total_floating:+.4f}\n"
                        f"<b>Banked:</b> ${total_banked:+.2f}\n━━━━━━━━━━━━━━━━━━━━\n"
-                       f"<b>Update:</b> {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+                       f"<b>Status:</b> RUNNING (NO IP RESTRICTION)")
                 
                 if not self.tg_id:
                     async with session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}) as r:
@@ -90,27 +92,19 @@ class AlphaHFT:
                 else:
                     await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": self.tg_id, "text": msg, "parse_mode": "HTML"})
             except: pass
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
 
     async def run(self):
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get('https://api.ipify.org') as resp:
-                    server_ip = await resp.text()
-                    log.info(f"🌐 SERVER IP: {server_ip} | 📱 DEVICE IP: {USER_DEVICE_IP}")
-            except: pass
+        if not await self.verify_and_set_env():
+            return
 
-            if not await self.verify_and_set_env():
-                await self.exchange.close()
-                return
-            
+        async with aiohttp.ClientSession() as session:
             asyncio.create_task(self.telegram_dashboard(session))
             
             try:
                 async with session.ws_connect(self.ws_url) as ws:
-                    sub_msg = {"op": "subscribe", "args": [f"publicTrade.{s.upper()}" for s in SYMBOLS]}
-                    await ws.send_json(sub_msg)
-                    log.info(f"🚀 Monitoring Top 20 via Bybit Stream")
+                    await ws.send_json({"op": "subscribe", "args": [f"publicTrade.{s.upper()}" for s in SYMBOLS]})
+                    log.info(f"🚀 WebSocket Connected to {self.ws_url}")
                     
                     async for msg in ws:
                         raw = json.loads(msg.data)
@@ -118,8 +112,6 @@ class AlphaHFT:
                         
                         for trade in raw["data"]:
                             symbol = trade["s"].lower()
-                            if symbol not in self.state: continue
-                            
                             s = self.state[symbol]
                             s["current_price"] = float(trade["p"])
                             s["price_history"].append(s["current_price"])
@@ -132,12 +124,14 @@ class AlphaHFT:
                             z_score = (s["current_price"] - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-10)
                             trend = self.kalman_filter(symbol, s["current_price"])
 
+                            # BUY LOGIC
                             if not s["position"] and self.ai.predict(rsi, z_score, sum(s["trade_flow"]), trend) >= 80:
                                 qty = BASE_USD / s["current_price"]
                                 await self.exchange.create_market_buy_order(symbol.upper(), qty)
                                 s["position"] = {"entry": s["current_price"], "amount": qty}
                                 log.info(f"✅ BUY {symbol.upper()}")
 
+                            # SELL LOGIC
                             elif s["position"]:
                                 pnl = (s["current_price"] - s["position"]["entry"]) / s["position"]["entry"]
                                 if pnl >= TP or pnl <= -SL:
@@ -146,24 +140,16 @@ class AlphaHFT:
                                     s["position"] = None
                                     log.info(f"💰 SELL {symbol.upper()} | PnL: {pnl:.4f}")
             except Exception as e:
-                log.error(f"Loop Error: {e}")
-            finally:
-                await self.exchange.close()
+                log.error(f"WebSocket/Loop Error: {e}")
+                await asyncio.sleep(10)
+
 if __name__ == "__main__":
     bot = AlphaHFT()
-    
     async def main_loop():
         while True:
             try:
-                log.info("🔄 Starting Bot Engine...")
                 await bot.run()
             except Exception as e:
-                log.error(f"⚠️ Critical Crash: {e}")
-                log.info("🔁 Restarting in 10 seconds...")
-                await asyncio.sleep(10) # Wait before restarting to avoid spamming Bybit
-
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        log.info("🛑 Manual Shutdown received.")
-
+                log.error(f"Critical Restarting: {e}")
+                await asyncio.sleep(10)
+    asyncio.run(main_loop())
