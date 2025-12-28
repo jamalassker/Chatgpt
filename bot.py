@@ -10,8 +10,7 @@ from collections import deque
 
 # ================= CONFIG =================
 BYBIT_API_KEY = "UYr9b62FtiRiN9hHue"
-BYBIT_SECRET = "
-rUDdj0QM2lQJQjVY1EeoUuPw29LldrNLtzKI"
+BYBIT_SECRET = "rUDdj0QM2lQJQjVY1EeoUuPw29LldrNLtzKI"
 
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
