@@ -5,3 +5,4 @@ ta>=0.11.0
 aiohttp>=3.9.0
 xgboost>=2.0.0
 python-dotenv>=1.0.0
+python-telegram-bot
