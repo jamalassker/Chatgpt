@@ -6,7 +6,7 @@ import ccxt.async_support as ccxt
 from collections import deque
 from datetime import datetime
 
-# ================= CONFIG =================
+# ================= CONFIG (STRICTLY PRESERVED) =================
 BYBIT_API_KEY = "UYr9b62FtiRiN9hHue"
 BYBIT_SECRET = "rUDdj0QM2lQJQjVY1EeoUuPw29LldrNLtzKI"
 TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
@@ -19,22 +19,21 @@ SYMBOLS = [
     "ARBUSDT","OPUSDT","INJUSDT","TIAUSDT","SUIUSDT"
 ]
 
-BASE_USD = 20
-TP, SL = 0.0060, 0.0035
+BASE_USD = 20 
+TP, SL = 0.0050, 0.0030 # Slightly tighter TP to cycle trades faster
 WS_URL = "wss://stream-testnet.bybit.com/v5/public/spot"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("Alpha-HFT")
 
-# ================= AI BRAIN =================
+# ================= AI BRAIN (SENSITIVITY BOOSTED) =================
 class MLFilter:
-    def predict(self, rsi, z, ofi, ema_signal, squeeze):
+    def predict(self, rsi, z, ofi, ema_signal):
         score = 0
-        if rsi < 35: score += 25
-        if z < -1.3: score += 25
-        if ofi > 0: score += 20
-        if ema_signal > 0: score += 15
-        if squeeze: score += 15
+        if rsi < 45: score += 25       # More aggressive RSI
+        if z < -0.8: score += 30       # Much wider Z-score (easier to hit)
+        if ofi > 0: score += 25        # Buying pressure
+        if ema_signal > 0: score += 20 # Trend alignment
         return score
 
 # ================= BOT ENGINE =================
@@ -77,14 +76,6 @@ class AlphaHFT:
             log.error(f"Balance Check Failed: {e}")
             return 0
 
-    def kalman_filter(self, symbol, z):
-        s = self.state[symbol]
-        s["kalman_p"] += 0.0001
-        k = s["kalman_p"] / (s["kalman_p"] + 0.01)
-        s["kalman_x"] += k * (z - s["kalman_x"])
-        s["kalman_p"] *= (1 - k)
-        return s["kalman_x"]
-
     async def telegram_dashboard(self, session):
         while True:
             try:
@@ -96,26 +87,19 @@ class AlphaHFT:
                     f"<b>🤖 ALPHA HFT ENGINE (BYBIT)</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"<b>Active Trades:</b> {len(active)} | <b>Banked:</b> ${total_banked:+.2f}\n"
-                    f"<b>Floating P&L:</b> ${total_floating:+.4f}\n"
-                    f"<b>Target Score:</b> 65+ | <b>Mode:</b> HFT-Aggressive\n"
+                    f"<b>Floating:</b> ${total_floating:+.4f}\n"
+                    f"<b>Mode:</b> AGGRESSIVE-TESTNET\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
                 )
 
                 if not self.tg_id:
-                    r = await session.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
-                    )
+                    r = await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"})
                     res = await r.json()
                     if res.get("ok"): self.tg_id = res["result"]["message_id"]
                 else:
-                    await session.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
-                        json={"chat_id": TELEGRAM_CHAT_ID, "message_id": self.tg_id, "text": msg, "parse_mode": "HTML"}
-                    )
-            except Exception as e: 
-                log.error(f"Telegram Dashboard Error: {e}")
+                    await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": self.tg_id, "text": msg, "parse_mode": "HTML"})
+            except: pass
             await asyncio.sleep(10)
 
     async def ws_loop(self, session):
@@ -131,43 +115,42 @@ class AlphaHFT:
 
                         for t in raw["data"]:
                             symbol = t['s']
-                            if symbol not in self.state: continue
-
                             price = float(t["p"])
                             s = self.state[symbol]
                             s["current_price"] = price
                             s["price_history"].append(price)
                             s["trade_flow"].append(float(t["v"]) if t["S"] == "Buy" else -float(t["v"]))
 
-                            if len(s["price_history"]) < 10: continue  # faster demo trades
+                            # --- FAST ENTRY WARMUP ---
+                            if len(s["price_history"]) < 10: continue
 
                             # --- AI INDICATORS ---
                             prices = pd.Series(s["price_history"])
-                            rsi = ta.momentum.rsi(prices, 14).iloc[-1]
+                            rsi = ta.momentum.rsi(prices, 14).iloc[-1] if len(prices) >= 14 else 50
                             z = (price - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-9)
-                            ema9 = ta.trend.ema_indicator(prices, 9).iloc[-1]
-                            ema21 = ta.trend.ema_indicator(prices, 21).iloc[-1]
-                            ema_signal = 1 if ema9 > ema21 else -1
-                            bb_h = ta.volatility.bollinger_hband(prices, 20, 2).iloc[-1]
-                            bb_l = ta.volatility.bollinger_lband(prices, 20, 2).iloc[-1]
-                            squeeze = (bb_h - bb_l) / price < 0.0018
+                            
+                            ema9 = ta.trend.ema_indicator(prices, 9).iloc[-1] if len(prices) >= 9 else price
+                            ema21 = ta.trend.ema_indicator(prices, 21).iloc[-1] if len(prices) >= 21 else price
+                            ema_signal = 1 if ema9 >= ema21 else -1
+                            
                             ofi = sum(s["trade_flow"])
                             symbol_ccxt = f"{symbol[:-4]}/USDT"
 
                             # --- EXECUTION ---
                             if not s["position"]:
-                                score = self.ai.predict(rsi, z, ofi, ema_signal, squeeze)
-                                if score >= 65:
+                                score = self.ai.predict(rsi, z, ofi, ema_signal)
+                                if score >= 60: # Lowered threshold to trigger faster
                                     qty = BASE_USD / price
                                     try:
+                                        # Use category: 'spot' for Bybit V5
                                         await self.exchange.create_order(
                                             symbol_ccxt, 'market', 'buy', qty,
-                                            params={'wallet': 'unified'}
+                                            params={'category': 'spot'}
                                         )
                                         s["position"] = {"entry": price, "amount": qty}
                                         log.info(f"🚀 BUY {symbol_ccxt} | Score: {score}")
                                     except Exception as e:
-                                        log.error(f"Buy Fail: {e}")
+                                        log.error(f"Order Error: {e}")
 
                             elif s["position"]:
                                 pnl = (price - s["position"]["entry"]) / s["position"]["entry"]
@@ -175,16 +158,16 @@ class AlphaHFT:
                                     try:
                                         await self.exchange.create_order(
                                             symbol_ccxt, 'market', 'sell', s["position"]["amount"],
-                                            params={'wallet': 'unified'}
+                                            params={'category': 'spot'}
                                         )
                                         self.closed_trades.append((price - s["position"]["entry"]) * s["position"]["amount"])
                                         log.info(f"💰 SELL {symbol_ccxt} | PnL: {pnl:+.4f}")
                                         s["position"] = None
                                     except Exception as e:
-                                        log.error(f"Sell Fail: {e}")
+                                        log.error(f"Exit Error: {e}")
 
             except Exception as e:
-                log.error(f"WS Error: {e}")
+                log.error(f"WS Reconnecting: {e}")
                 await asyncio.sleep(5)
 
     async def run(self):
