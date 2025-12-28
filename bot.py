@@ -140,26 +140,34 @@ class AlphaHFTSimulator:
                                 f"Wallet: `${self.wallet:.2f}`"
                             )
                             s["position"] = None
-
 async def main():
-    # Initialize Engine
+    # 1. Initialize Engine
     engine = AlphaHFTSimulator()
     
-    # Initialize Telegram Application for Commands
+    # 2. Build Telegram Application
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", engine.handle_status))
     app.add_handler(CommandHandler("balance", engine.handle_status))
 
-    # Run WebSocket and TG Bot concurrently
-    await asyncio.gather(
-        engine.run_strategy(),
-        app.initialize(),
-        app.start(),
-        app.updater.start_polling()
-    )
+    # 3. CRITICAL: Proper Async Lifecycle
+    # Using 'async with' handles initialize() and shutdown() automatically
+    async with app:
+        await app.start()
+        # Start polling in the background
+        await app.updater.start_polling()
+        
+        # Run your trading strategy
+        # This will keep the loop alive
+        await engine.run_strategy()
+
+        # Shutdown sequence (if run_strategy ever finishes)
+        await app.updater.stop()
+        await app.stop()
 
 if __name__ == "__main__":
     try:
+        # Use a single entry point for the event loop
         asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Stopped.")
+    except (KeyboardInterrupt, SystemExit):
+        log.info("System Offline.")
+
