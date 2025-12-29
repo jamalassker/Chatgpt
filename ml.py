@@ -1,5 +1,4 @@
 
-
 import asyncio, json, aiohttp, logging, numpy as np, pandas as pd, ta
 from collections import deque
 from river import linear_model, preprocessing, compose, metrics
@@ -9,7 +8,7 @@ from telegram import Bot
 
 # 1. Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("Alpha-ML-V3")
+log = logging.getLogger("Alpha-ML-V4")
 
 # Download sentiment tools
 nltk.download('vader_lexicon', quiet=True)
@@ -20,23 +19,27 @@ TELEGRAM_CHAT_ID = "5665906172"
 CRYPTOPANIC_API_KEY = "936ee60c210fd21b853971b458bfdf6ef2515eb3"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-BASE_USD = 10.0  # Safe amount for your $10-20 budget
+BASE_USD = 10.0  
 # ==========================================
 
 class AlphaMLBot:
     def __init__(self):
-        self.wallet = 20.0  # Starting simulation balance
+        self.wallet = 20.0  
         self.sia = SentimentIntensityAnalyzer()
         self.current_sentiment = 0.0
         self.tg_bot = Bot(token=TELEGRAM_TOKEN)
         
-        # ML Engine
-        self.model = compose.Pipeline(preprocessing.StandardScaler(), linear_model.LogisticRegression())
+        # ML Engine: Standard Scaler + Online Logistic Regression
+        self.model = compose.Pipeline(
+            preprocessing.StandardScaler(), 
+            linear_model.LogisticRegression()
+        )
         self.metric = metrics.Accuracy()
         
-        # State Management
+        # State Management (Expanded deques for advanced indicators)
         self.state = {s: {
-            "price_history": deque(maxlen=100), 
+            "price_history": deque(maxlen=200), # Increased for MFI/Volatility
+            "flow": deque(maxlen=50),           # For Volume Imbalance
             "position": None, 
             "current_price": 0.0
         } for s in SYMBOLS}
@@ -48,7 +51,6 @@ class AlphaMLBot:
             log.error(f"TG Notification Error: {e}")
 
     def get_total_metrics(self):
-        """Calculates total floating P&L across all open trades."""
         floating_pnl = 0.0
         for s, data in self.state.items():
             if data["position"]:
@@ -80,15 +82,20 @@ class AlphaMLBot:
         s = self.state[symbol]
         prices = pd.Series(list(s["price_history"]))
         if len(prices) < 30: return None
+        
+        # Combined Advanced Features
         return {
-            "rsi": ta.momentum.rsi(prices).iloc[-1],
+            "rsi": ta.momentum.rsi(prices, window=14).iloc[-1],
             "zscore": (prices.iloc[-1] - prices.mean()) / (prices.std() + 1e-9),
-            "news": self.current_sentiment
+            "mfi": ta.volume.money_flow_index(prices, prices, prices, pd.Series([1]*len(prices)), window=14).iloc[-1],
+            "volatility": prices.pct_change().std(),
+            "flow_imbalance": sum(s["flow"]),
+            "news_mood": self.current_sentiment
         }
 
     async def run_hft(self):
-        log.info("🚀 HFT Strategy Starting...")
-        await self.send_tg("🤖 *ML Bot Online*\nMonitoring 5 symbols with News Sentiment.")
+        log.info("🚀 Advanced ML Engine Starting...")
+        await self.send_tg("🤖 *Alpha-ML V4 Online*\nTechnical + Sentiment Analysis active.")
         
         async with aiohttp.ClientSession() as session:
             streams = "/".join([f"{s.lower()}@trade" for s in SYMBOLS])
@@ -98,35 +105,45 @@ class AlphaMLBot:
                     if not raw: continue
                     
                     symbol, price = raw["s"], float(raw["p"])
+                    vol = float(raw["q"])
+                    is_maker = raw["m"]
+
                     s = self.state[symbol]
                     s["current_price"] = price
                     s["price_history"].append(price)
+                    # Track trade flow (Positive for buys, Negative for sells)
+                    s["flow"].append(-vol if is_maker else vol)
                     
                     features = self.get_features(symbol)
                     if not features: continue
                     
+                    # ML Decision Logic
                     prob_buy = self.model.predict_proba_one(features).get(True, 0.5)
                     float_pnl = self.get_total_metrics()
 
-                    # --- BUY LOGIC ---
+                    # --- BUY LOGIC (80% Confidence + Neutral/Bullish Sentiment) ---
                     if not s["position"] and prob_buy > 0.80 and self.current_sentiment > -0.1:
                         s["position"] = {"entry": price, "qty": BASE_USD/price, "f": features}
                         self.wallet -= BASE_USD
-                        log.info(f"🟢 BUY {symbol} @ {price}")
+                        log.info(f"🟢 BUY {symbol} @ {price} | ML: {prob_buy:.1%}")
 
-                    # --- SELL LOGIC (TP: 0.8% / SL: 0.4%) ---
+                    # --- SELL LOGIC (TP/SL + Online Learning) ---
                     elif s["position"]:
                         pnl_pct = (price - s["position"]["entry"]) / s["position"]["entry"]
                         
                         if pnl_pct >= 0.008 or pnl_pct <= -0.004:
-                            self.model.learn_one(s["position"]["f"], pnl_pct > 0)
+                            is_win = pnl_pct > 0
+                            # Teach the model which features led to this result
+                            self.model.learn_one(s["position"]["f"], is_win)
+                            self.metric.update(is_win, True)
+                            
                             trade_result = s["position"]["qty"] * price
                             self.wallet += trade_result
                             
                             status_msg = (
                                 f"🏁 *Trade Closed: {symbol}*\n"
-                                f"Result: `{pnl_pct:+.2%}`\n"
-                                f"💰 *Realized Wallet:* `${self.wallet:.2f}`\n"
+                                f"Result: `{pnl_pct:+.2%}` ({'✅ WIN' if is_win else '❌ LOSS'})\n"
+                                f"💰 *Wallet:* `${self.wallet:.2f}`\n"
                                 f"📈 *Floating P&L:* `${float_pnl:+.2f}`"
                             )
                             await self.send_tg(status_msg)
@@ -137,5 +154,8 @@ async def main():
     await asyncio.gather(bot.update_sentiment(), bot.run_hft())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("System Stopped.")
 
