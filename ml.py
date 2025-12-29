@@ -1,6 +1,6 @@
 
 
-    import asyncio, json, aiohttp, logging, numpy as np, pandas as pd, ta
+import asyncio, json, aiohttp, logging, numpy as np, pandas as pd, ta
 from collections import deque
 from river import linear_model, preprocessing, compose, metrics
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
