@@ -1,173 +1,86 @@
-
-import asyncio, json, aiohttp, logging
+import asyncio
+import ccxt.pro as ccxt
 import numpy as np
-import pandas as pd
-import ta
-from collections import deque
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot
 
-# ================= CONFIG =================
-TELEGRAM_TOKEN = "8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA"
-TELEGRAM_CHAT_ID = "5665906172"
+# --- CONFIG ---
+API_KEY = 'p4FKZRHA26Z3VWyRPF5xZFc3aDU8vxTy7OCULtX7wCgN6l3EaNl882q4JzruPIsE'
+SECRET_KEY = 'CXqJa5JaKxwVPT5ik3EBbB2Mm0IMp4J0I0OSEY1Q6SKk7PkWHwf7tyDBhxKwLn1b'
+TELEGRAM_TOKEN = '8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA'
+CHAT_ID = '8560134874'
+SYMBOL = 'BTC/USDT'
+LEVERAGE = 10
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
-    "TRXUSDT", "MATICUSDT", "SHIBUSDT", "TONUSDT", "LTCUSDT",
-    "DAIUSDT", "BCHUSDT", "NEARUSDT", "LEOUSDT", "UNIUSDT"
-]
+# Initialize
+exchange = ccxt.binance({'apiKey': API_KEY, 'secret': SECRET_KEY, 'enableRateLimit': True})
+tg_bot = Bot(token=TELEGRAM_TOKEN)
 
-BASE_USD = 20.0       # Cost per trade
-INITIAL_WALLET = 1000.0
-WS_URL = "wss://stream.binance.com:9443/stream"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("Alpha-HFT-Sim")
-
-class AlphaHFTSimulator:
+class PropBot:
     def __init__(self):
-        self.wallet = INITIAL_WALLET
-        self.trades_count = 0
-        self.start_time = pd.Timestamp.now()
-        
-        # State Management
-        self.state = {
-            s: {
-                "price": 0.0,
-                "price_history": deque(maxlen=100),
-                "trade_flow": deque(maxlen=30),
-                "position": None, # Stores {'entry': price, 'qty': qty}
-            } for s in SYMBOLS
-        }
+        self.entry_price = 0
+        self.position_size = 0
+        self.pnl_history = []
+        self.is_running = True
 
-    def get_floating_pnl(self):
-        """Calculates total P/L of currently open positions."""
-        float_pnl = 0.0
-        for s, data in self.state.items():
-            if data["position"]:
-                current_val = data["price"] * data["position"]["qty"]
-                entry_val = data["position"]["entry"] * data["position"]["qty"]
-                float_pnl += (current_val - entry_val)
-        return float_pnl
+    async def update_telegram_pnl(self):
+        """Dynamic floating PnL updated every 5 seconds"""
+        message_id = None
+        while self.is_running:
+            if self.position_size != 0:
+                ticker = await exchange.fetch_ticker(SYMBOL)
+                current_price = ticker['last']
+                # Floating PnL calculation
+                pnl = (current_price - self.entry_price) * self.position_size * LEVERAGE
+                pnl_pct = (pnl / (self.entry_price * abs(self.position_size))) * 100
+                
+                status = "🟢 LONG" if self.position_size > 0 else "🔴 SHORT"
+                text = f"📊 *Live Trading Status*\nPair: {SYMBOL}\nPos: {status}\n*Floating PnL: ${pnl:.2f} ({pnl_pct:.2f}%)*"
+                
+                try:
+                    if not message_id:
+                        msg = await tg_bot.send_message(CHAT_ID, text, parse_mode='Markdown')
+                        message_id = msg.message_id
+                    else:
+                        await tg_bot.edit_message_text(text, CHAT_ID, message_id, parse_mode='Markdown')
+                except Exception as e:
+                    print(f"TG Error: {e}")
+            await asyncio.sleep(5)
 
-    async def send_tg(self, message):
-        """Standard notification helper."""
-        try:
-            bot = Bot(token=TELEGRAM_TOKEN)
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-        except Exception as e:
-            log.error(f"TG Error: {e}")
+    async def trade_logic(self):
+        """HFT Order Flow Scalping Engine"""
+        while self.is_running:
+            try:
+                # Get L2 Order Book
+                ob = await exchange.watch_order_book(SYMBOL)
+                bids = np.array(ob['bids'][:5]) # Top 5 levels
+                asks = np.array(ob['asks'][:5])
+                
+                # Calculate Imbalance (Quant Logic)
+                bid_vol = np.sum(bids[:, 1])
+                ask_vol = np.sum(asks[:, 1])
+                imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
 
-    async def handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Responds to /status command in Telegram."""
-        float_pnl = self.get_floating_pnl()
-        open_positions = [s for s, d in self.state.items() if d["position"]]
-        
-        msg = (
-            f"📊 *Live Account Status*\n"
-            f"--------------------------\n"
-            f"💰 *Wallet:* `${self.wallet:.2f}`\n"
-            f"📈 *Floating P/L:* `${float_pnl:+.2f}`\n"
-            f"🔥 *Total Equity:* `${self.wallet + float_pnl:.2f}`\n"
-            f"📦 *Open Trades:* `{len(open_positions)}`\n"
-            f"✅ *Completed Trades:* `{self.trades_count}`\n"
-            f"⏱ *Uptime:* `{str(pd.Timestamp.now() - self.start_time).split('.')[0]}`"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+                # Scalp Signal (If imbalance > 0.8, heavy buy pressure)
+                if imbalance > 0.8 and self.position_size <= 0:
+                    print(">>> HFT AI SIGNAL: AGGRESSIVE BUY")
+                    # self.entry_price = bids[0][0]
+                    # self.position_size = 0.01 
+                    # await exchange.create_market_buy_order(SYMBOL, 0.01)
 
-    async def run_strategy(self):
-        """Main engine loop."""
-        log.info("🚀 Engine starting with 20 symbols...")
-        await self.send_tg("🚀 *Alpha-HFT Simulator Online*\nMonitoring 20 Top Symbols.\nSend `/status` for updates.")
+                elif imbalance < -0.8 and self.position_size >= 0:
+                    print(">>> HFT AI SIGNAL: AGGRESSIVE SELL")
+                    # await exchange.create_market_sell_order(SYMBOL, 0.01)
 
-        async with aiohttp.ClientSession() as session:
-            streams = "/".join([f"{s.lower()}@trade" for s in SYMBOLS])
-            async with session.ws_connect(f"{WS_URL}?streams={streams}") as ws:
-                async for msg in ws:
-                    raw = json.loads(msg.data)
-                    data = raw.get("data")
-                    if not data: continue
+            except Exception as e:
+                print(f"Trading Error: {e}")
+                await asyncio.sleep(1)
 
-                    symbol = data["s"]
-                    price = float(data["p"])
-                    vol = float(data["q"])
-                    is_maker = data["m"]
-
-                    s = self.state[symbol]
-                    s["price"] = price # Update current price for floating P/L
-                    s["price_history"].append(price)
-                    s["trade_flow"].append(-vol if is_maker else vol)
-
-                    if len(s["price_history"]) < 20: continue
-
-                    # --- LOGIC ---
-                    prices = pd.Series(s["price_history"])
-                    rsi = ta.momentum.rsi(prices, window=14).iloc[-1] if len(prices) >= 14 else 50
-                    z_score = (price - np.mean(s["price_history"])) / (np.std(s["price_history"]) + 1e-9)
-                    
-                    score = 0
-                    if rsi < 42: score += 40
-                    if z_score < -1.8: score += 40
-                    if sum(s["trade_flow"]) > 0: score += 20
-
-                    # --- EXECUTION ---
-                    # 1. BUY
-                    if not s["position"] and score >= 80 and self.wallet >= BASE_USD:
-                        qty = BASE_USD / price
-                        s["position"] = {"entry": price, "qty": qty}
-                        self.wallet -= BASE_USD # Deduct cost
-                        log.info(f"🟢 [BUY] {symbol} @ {price}")
-
-                    # 2. SELL (Take Profit / Stop Loss)
-                    elif s["position"]:
-                        entry = s["position"]["entry"]
-                        pnl_pct = (price - entry) / entry
-                        
-                        if pnl_pct >= 0.008 or pnl_pct <= -0.004:
-                            # Calculate exit value
-                            exit_value = s["position"]["qty"] * price
-                            trade_pnl_usd = exit_value - BASE_USD
-                            
-                            self.wallet += exit_value # Add proceeds back
-                            self.trades_count += 1
-                            
-                            log.info(f"🔴 [SELL] {symbol} | PnL: {pnl_pct:+.2%}")
-                            await self.send_tg(
-                                f"🏁 *Trade Closed: {symbol}*\n"
-                                f"Result: `{'PROFIT' if trade_pnl_usd > 0 else 'LOSS'}`\n"
-                                f"PnL: `{pnl_pct:+.2%}` (${trade_pnl_usd:+.2f})\n"
-                                f"Wallet: `${self.wallet:.2f}`"
-                            )
-                            s["position"] = None
-async def main():
-    # 1. Initialize Engine
-    engine = AlphaHFTSimulator()
-    
-    # 2. Build Telegram Application
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("status", engine.handle_status))
-    app.add_handler(CommandHandler("balance", engine.handle_status))
-
-    # 3. CRITICAL: Proper Async Lifecycle
-    # Using 'async with' handles initialize() and shutdown() automatically
-    async with app:
-        await app.start()
-        # Start polling in the background
-        await app.updater.start_polling()
-        
-        # Run your trading strategy
-        # This will keep the loop alive
-        await engine.run_strategy()
-
-        # Shutdown sequence (if run_strategy ever finishes)
-        await app.updater.stop()
-        await app.stop()
+async def start():
+    bot = PropBot()
+    # Run both the high-speed trader and the telegram updater concurrently
+    await asyncio.gather(bot.trade_logic(), bot.update_telegram_pnl())
 
 if __name__ == "__main__":
-    try:
-        # Use a single entry point for the event loop
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("System Offline.")
+    asyncio.run(start())
+
 
