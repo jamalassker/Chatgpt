@@ -1,120 +1,103 @@
 import asyncio, aiohttp, numpy as np, pandas as pd
-from binance import AsyncClient, BinanceSocketManager
+from binance import AsyncClient
 from binance.enums import *
 
-# --- CREDENTIALS ---
+# --- CREDENTIALS (RE-INTEGRATED) ---
 API_KEY = 'Et7oRtg2CLHyaRGBoQOoTFt7LSixfav28k0bnVfcgzxd2KTal4xPlxZ9aO6sr1EJ'
 API_SECRET = '2LfotApekUjBH6jScuzj1c47eEnq1ViXsNRIP4ydYqYWl6brLhU3JY4vqlftnUIo'
 TG_TOKEN = '8560134874:AAHF4efOAdsg2Y01eBHF-2DzEUNf9WAdniA'
 TG_CHAT_ID = '5665906172'
 
-SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 
-    'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'LINKUSDT', 'AVAXUSDT',
-    'DOTUSDT', 'LTCUSDT', 'BCHUSDT', 'SUIUSDT', 'NEARUSDT',
-    'SHIBUSDT', 'PEPEUSDT', 'XMRUSDT', 'STXUSDT', 'UNIUSDT'
-]
+# DYNAMICALLY FETCH TOP 100 USDT PAIRS
+async def get_top_100_symbols(client):
+    try:
+        info = await client.get_exchange_info()
+        # Filter for trading USDT pairs
+        symbols = [s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')]
+        # Sort or slice to get the top 100
+        return symbols[:100]
+    except Exception as e:
+        print(f"Error fetching symbols: {e}")
+        return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT'] # Fallback
 
-# Tracking dictionary for Floating P&L
-active_positions = {} # { 'BTCUSDT': {'buy_price': 60000, 'qty': 0.001} }
+active_positions = {}
 
 async def send_tg_async(msg):
-    """Non-blocking Telegram sender using aiohttp"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    params = {'chat_id': TG_CHAT_ID, 'text': msg}
+    params = {'chat_id': TG_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                return await resp.json()
-    except Exception: pass
+            async with session.get(url, params=params) as resp: return await resp.json()
+    except: pass
 
-async def get_signals(client, symbol):
-    klines = await client.get_klines(symbol=symbol, interval='1m', limit=30)
-    df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qa','nt','tb','tq','i']).astype(float)
+async def get_elite_signals(client, symbol):
+    # Fetching klines - Loosened window to 20 for faster signal generation
+    klines = await client.get_klines(symbol=symbol, interval='1m', limit=20)
+    df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qav','nt','tbv','tqv','i']).astype(float)
     
-    df['tp'] = (df['h'] + df['l'] + df['c']) / 3
-    vwap = (df['tp'] * df['v']).sum() / (df['v'].sum() + 0.0001)
-    z_score = (df['c'].iloc[-1] - df['c'].mean()) / (df['c'].std() + 0.00001)
+    # VOLUME DELTA (The Aggressive Push)
+    df['sell_vol'] = df['v'] - df['tbv']
+    df['delta'] = df['tbv'] - df['sell_vol']
+    avg_delta = df['delta'].mean()
+    current_delta = df['delta'].iloc[-1]
     
+    # OBI (Order Book Imbalance)
     depth = await client.get_order_book(symbol=symbol, limit=10)
     bid_v = sum([float(b[1]) for b in depth['bids']])
     ask_v = sum([float(a[1]) for a in depth['asks']])
     obi = (bid_v - ask_v) / (bid_v + ask_v)
     
-    return z_score, obi, vwap, df['c'].iloc[-1]
-
-async def monitor_portfolio(client):
-    """Sends periodic updates of balance and floating P&L"""
-    while True:
-        try:
-            # 1. Check USDT Balance
-            acc_info = await client.get_account()
-            usdt_balance = next((item['free'] for item in acc_info['balances'] if item['asset'] == 'USDT'), 0)
-            
-            # 2. Calculate Floating P&L
-            total_unrealized_pnl = 0
-            pos_count = len(active_positions)
-            
-            for sym, data in active_positions.items():
-                ticker = await client.get_symbol_ticker(symbol=sym)
-                current_price = float(ticker['price'])
-                pnl = (current_price - data['buy_price']) * data['qty']
-                total_unrealized_pnl += pnl
-
-            status_msg = (
-                f"📊 **PORTFOLIO UPDATE**\n"
-                f"💰 USDT Balance: {float(usdt_balance):.2f}\n"
-                f"📈 Open Positions: {pos_count}\n"
-                f"💸 Floating P&L: {'+' if total_unrealized_pnl >= 0 else ''}{total_unrealized_pnl:.4f} USDT"
-            )
-            await send_tg_async(status_msg)
-            await asyncio.sleep(60) # Send update every 60 seconds
-        except Exception as e:
-            await asyncio.sleep(10)
+    # Z-SCORE (Loosened from -2.1 to -1.8 for more trades)
+    df['tp'] = (df['h'] + df['l'] + df['c']) / 3
+    vwap = (df['tp'] * df['v']).sum() / (df['v'].sum() + 0.0001)
+    z_score = (df['c'].iloc[-1] - df['c'].mean()) / (df['c'].std() + 0.00001)
+    
+    return z_score, obi, vwap, current_delta, avg_delta, df['c'].iloc[-1]
 
 async def trade_logic(client, symbol):
-    trade_amount = 0.00015 # Note: In real trading, adjust per symbol lot size
-    print(f"📡 Monitoring {symbol}...")
-    
+    # $100 capital: roughly 18 slots of $5.20 to stay above Binance $5 minimum
+    usd_per_trade = 5.2 
+    max_concurrent_trades = 18 
+
     while True:
         try:
-            z, obi, vwap, price = await get_signals(client, symbol)
+            z, obi, vwap, delta, avg_delta, price = await get_elite_signals(client, symbol)
             
-            # ENTRY LOGIC
-            if symbol not in active_positions and z < -2.1 and obi > 0.4 and price < vwap:
-                await client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=trade_amount)
-                active_positions[symbol] = {'buy_price': price, 'qty': trade_amount}
-                await send_tg_async(f"🚀 {symbol} BUY\nPrice: {price}\nZ: {z:.2f}")
+            # Simple qty calculation (note: real production needs lot_size filtering)
+            qty = round(usd_per_trade / price, 6)
+            
+            # ELITE LOOSER ENTRY: Z < -1.8 | OBI > 0.2 | Delta Push
+            if symbol not in active_positions and len(active_positions) < max_concurrent_trades:
+                if z < -1.8 and obi > 0.2 and delta > (avg_delta * 0.5):
+                    await client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty)
+                    active_positions[symbol] = {'p': price, 'q': qty}
+                    await send_tg_async(f"⚡️ *ENTRY:* {symbol}\nPrice: `{price}`\nZ: `{z:.2f}`")
 
-            # EXIT LOGIC
+            # ELITE QUICK EXIT: 0.20% Profit Scalp or Overbought
             elif symbol in active_positions:
-                buy_p = active_positions[symbol]['buy_price']
-                # Exit if Overbought OR 0.25% Profit reached
-                if z > 1.9 or price > (buy_p * 1.0025):
-                    await client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=trade_amount)
-                    profit = (price - buy_p) * trade_amount
+                buy_p = active_positions[symbol]['p']
+                qty_pos = active_positions[symbol]['q']
+                
+                if z > 1.5 or price > (buy_p * 1.002):
+                    await client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty_pos)
+                    prof = (price - buy_p) * qty_pos
                     del active_positions[symbol]
-                    await send_tg_async(f"💰 {symbol} SELL\nPrice: {price}\nProfit: {profit:.4f} USDT")
-            
-            await asyncio.sleep(2)
+                    await send_tg_async(f"💰 *PROFIT:* {symbol}\nGain: `+{prof:.4f} USDT`")
+
+            await asyncio.sleep(4) # 4s delay to prevent rate limits with 100 coins
         except Exception:
             await asyncio.sleep(5)
 
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET, testnet=True)
-    await send_tg_async("🌑 APEX MULTI-HFT CORE ACTIVE\nZ-Score + OBI + Floating P&L Tracking Enabled")
+    symbols = await get_top_100_symbols(client)
     
-    # Run trading logic for all symbols AND the portfolio monitor
-    tasks = [trade_logic(client, sym) for sym in SYMBOLS]
-    tasks.append(monitor_portfolio(client)) 
+    await send_tg_async(f"🚀 *CENTURION MODE ACTIVE*\nPairs: `{len(symbols)}` | Target: `0.2% Scalps` | Risk: `Aggressive`")
     
+    # Launch monitoring for all 100 pairs
+    tasks = [trade_logic(client, s) for s in symbols]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
-
+    asyncio.run(main())
 
