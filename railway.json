@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements2.txt && playwright install --with-deps chromium"
+  },
+  "deploy": {
+    "startCommand": "python Saas.py"
+  }
+}
