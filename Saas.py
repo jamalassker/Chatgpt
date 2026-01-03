@@ -6,6 +6,11 @@ import os
 
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"message": "API is online", "status": "running"}
+
+
 async def scrape_leads(niche: str, location: str):
     async with async_playwright() as p:
         # Launch with no-sandbox (required for Linux/Railway)
