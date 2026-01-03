@@ -1,4 +1,3 @@
-
 import time, requests, numpy as np, pandas as pd
 from binance.client import Client
 from binance.enums import *
@@ -11,54 +10,60 @@ TG_CHAT_ID = '5665906172'
 
 client = Client(API_KEY, API_SECRET, testnet=True)
 SYMBOL = 'BTCUSDT'
-TRADE_SIZE = 0.00015 # ~$10
-WINDOW = 30 # Looking at last 30 data points for HFT
+TRADE_SIZE = 0.00015 
 
 def send_tg(msg):
     try: requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage?chat_id={TG_CHAT_ID}&text={msg}")
     except: pass
 
-def get_hft_signals():
-    # Fetching 1m candles but analyzing micro-movements
-    klines = client.get_klines(symbol=SYMBOL, interval='1m', limit=WINDOW)
-    closes = np.array([float(k[4]) for k in klines])
+def get_apex_signals():
+    # 1. Fetch Order Book Depth (The HFT "Secret Sauce")
+    depth = client.get_order_book(symbol=SYMBOL, limit=20)
+    bid_vol = sum([float(b[1]) for b in depth['bids']])
+    ask_vol = sum([float(a[1]) for a in depth['asks']])
+    obi = (bid_vol - ask_vol) / (bid_vol + ask_vol) # Range -1 to 1
     
-    # Calculate Z-Score
-    mean = np.mean(closes)
-    std = np.std(closes)
-    z_score = (closes[-1] - mean) / std
+    # 2. Fetch Klines for VWAP & Z-Score
+    klines = client.get_klines(symbol=SYMBOL, interval='1m', limit=30)
+    df = pd.DataFrame(klines, columns=['t','o','h','l','c','v','ct','qa','nt','tb','tq','i']).astype(float)
     
-    # Calculate Momentum (Price Change Velocity)
-    momentum = (closes[-1] - closes[-5]) / closes[-5] * 100
+    # VWAP Calculation
+    df['tp'] = (df['h'] + df['l'] + df['c']) / 3
+    vwap = (df['tp'] * df['v']).sum() / df['v'].sum()
     
-    return z_score, momentum, closes[-1]
+    # Z-Score
+    mean = df['c'].mean()
+    z_score = (df['c'].iloc[-1] - mean) / (df['c'].std() + 0.00001)
+    
+    return z_score, obi, vwap, df['c'].iloc[-1]
 
-print("⚡ Super HFT AI Bot Deploying...")
-send_tg("🚀 2026 Super HFT Bot Active\nStrategy: Z-Score + Momentum\nTarget: High-Frequency Small Wins")
+print("🌑 Apex AI HFT Core Initializing...")
+send_tg("🕵️‍♂️ APEX HFT ONLINE\nAnalyzing Order Book Depth & VWAP\nMonitoring $10 Scalp Opportunities")
 
-in_position = False
+in_pos = False
+last_buy = 0
 
 while True:
     try:
-        z, mom, price = get_hft_signals()
+        z, obi, vwap, price = get_apex_signals()
         
-        # LOGIC: Buy if price is heavily oversold (Z < -2.2) AND momentum starts turning up
-        if z < -2.2 and mom > -0.01 and not in_position:
+        # BUY: Price is cheap (Z < -2.0) AND Order Book shows Buy Pressure (OBI > 0.3)
+        if not in_pos and z < -2.0 and obi > 0.3 and price < vwap:
             client.create_order(symbol=SYMBOL, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=TRADE_SIZE)
-            send_tg(f"🟢 HFT BUY\nZ-Score: {z:.2f}\nPrice: {price}\nStatus: Scalping...")
-            in_position = True
+            last_buy = price
+            send_tg(f"🔥 APEX BUY\nPrice: {price}\nOBI: {obi:.2f} (Strong Demand)\nZ: {z:.2f}")
+            in_pos = True
             
-        # LOGIC: Sell if price is overbought (Z > 2.0) OR if we hit a 0.3% micro-profit
-        elif in_position and (z > 2.0 or mom < -0.02):
+        # SELL: Price is over-extended (Z > 1.8) OR Profit target hit
+        elif in_pos and (z > 1.8 or price > (last_buy * 1.002)): # 0.2% Scalp
             client.create_order(symbol=SYMBOL, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=TRADE_SIZE)
-            send_tg(f"🔴 HFT EXIT\nZ-Score: {z:.2f}\nPrice: {price}\nResult: Win Captured")
-            in_position = False
+            send_tg(f"💰 APEX PROFIT\nPrice: {price}\nStrategy: Micro-Scalp Successful")
+            in_pos = False
 
-        time.sleep(5) # 2026 HFT standard for REST API
+        time.sleep(2) # Ultra-fast 2026 polling
         
     except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(2)
-
+        print(f"Latency/API Error: {e}")
+        time.sleep(1)
 
 
